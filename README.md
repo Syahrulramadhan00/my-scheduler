@@ -1,36 +1,143 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+Online Meeting Scheduler
 
-## Getting Started
+A high-performance meeting scheduler built with Next.js 14 and Supabase. This project focuses on solving the core challenges of timezone management and booking concurrency using database-level constraints rather than fragile application logic.
 
-First, run the development server:
+🚀 Setup & Run
 
-```bash
+Prerequisites
+
+Node.js 18+
+
+A Supabase project (Free tier works)
+
+Installation
+
+Clone the repository and install dependencies:
+
+npm install
+
+
+Create a .env.local file in the root:
+
+NEXT_PUBLIC_SUPABASE_URL=your_project_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
+
+
+Database Setup: Run the SQL scripts provided in the sql/ folder (or copy from below) in your Supabase SQL Editor to set up the tables and concurrency constraints.
+
+Enable btree_gist extension.
+
+Create tables: organizer_settings, bookings, blackouts.
+
+Add RLS policies for public access (MVP mode).
+
+Running Locally
+
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Open http://localhost:3000.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+🏗 Architecture
 
-## Learn More
+Frontend: Next.js 14 (App Router), Tailwind CSS, Shadcn UI (Radix Primitives).
 
-To learn more about Next.js, take a look at the following resources:
+Backend: Next.js API Routes (Serverless functions).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Database: PostgreSQL (via Supabase).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+State Management: React Hooks + Server State (via fetch in Client Components).
 
-## Deploy on Vercel
+Key Components:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+BookingWizard: Handles the calendar interaction, time slot calculation, and booking submission.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+ScheduleList: Real-time dashboard of upcoming confirmed meetings.
+
+SettingsForm: Configure availability (Timezone, Buffers, Working Hours).
+
+💾 Data Model & Concurrency
+
+The Concurrency Problem
+
+Preventing double-booking (Race Conditions) is the critical requirement. Checking for availability in code (SELECT * FROM bookings...) before inserting is unsafe under high load.
+
+The Solution: Postgres Exclusion Constraints
+
+Instead of application locks, we use PostgreSQL's native GiST index to strictly enforce non-overlapping time ranges at the database level.
+
+Table Schema (bookings):
+
+create table bookings (
+  id uuid primary key default gen_random_uuid(),
+  organizer_id text,
+  start_time timestamptz,
+  end_time timestamptz,
+  
+  -- The "Buffered" time is the actual block occupied in the calendar
+  buffered_start_time timestamptz, 
+  buffered_end_time timestamptz,
+
+  -- 🛑 THE GUARDRAIL
+  -- Rejects any insert where organizer_id matches AND time ranges overlap
+  exclude using gist (
+    organizer_id with =,
+    tstzrange(buffered_start_time, buffered_end_time) with &&
+  )
+);
+
+
+This ensures 100% data integrity. If two requests try to book the same slot simultaneously, the slower transaction fails immediately at the DB layer.
+
+🧪 How to Test
+
+1. Booking Flow
+
+Go to the home page (/).
+
+Click "New Booking" (Drawer opens).
+
+Select a date. The API calculates slots based on "Jakarta" working hours (configurable in Settings).
+
+Pick a slot, enter email, and Confirm.
+
+The meeting appears in the list.
+
+2. Testing Concurrency
+
+Open the app in two different browser windows/tabs.
+
+Navigate to the same date and select the exact same time slot in both windows.
+
+Click "Confirm" in Window A. (Success)
+
+Immediately click "Confirm" in Window B.
+
+Result: Window B receives a toast error: "Slot taken. Please pick another."
+
+3. Settings & Timezones
+
+Go to Settings (Gear Icon).
+
+Change "Meeting Duration" to 60 mins or "Buffer" to 30 mins.
+
+Go back to booking; slots will regenerate reflecting these new rules.
+
+🤖 AI Usage Notes
+
+Tools Used: Gemini 3.0
+Usage:
+
+SQL Generation: Used to generate the complex syntax for tstzrange exclusion constraints in PostgreSQL, ensuring the syntax for the GiST index was correct.
+
+UI Scaffolding: Accelerated the creation of Shadcn UI components (Forms, Cards, Drawers) to focus time on the backend logic.
+
+Verification: Manually verified all SQL logic by attempting overlapping inserts in the Supabase dashboard to confirm constraints triggered correctly.
+
+⚠️ Limitations & Next Steps
+
+Authentication: Currently uses a hardcoded organizer_id. Next step: Integration Supabase Auth for multi-tenant support.
+
+Email Notifications: Emails are collected but no actual email is sent. Next step: Integrate Resend or Nodemailer on the API route.
+
+Recurring Meetings: The current schema supports single instances. Next step: Add rrule support for recurring patterns.
