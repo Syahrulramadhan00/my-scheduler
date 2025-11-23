@@ -1,0 +1,139 @@
+-- ==========================================
+-- MASTER SCHEMA MIGRATION
+-- Meeting Scheduler (Speedrun Edition)
+-- ==========================================
+
+-- 1. CLEANUP (Wipe everything to start fresh)
+-- ⚠️ WARNING: This deletes all data!
+drop function if exists reschedule_meeting;
+drop table if exists bookings;
+drop table if exists blackouts;
+drop table if exists organizer_settings;
+drop extension if exists btree_gist;
+
+-- 2. EXTENSIONS
+-- Required for the exclusion constraints (overlapping time checks)
+create extension if not exists btree_gist;
+
+-- 3. ORGANIZER SETTINGS TABLE
+create table organizer_settings (
+  organizer_id text primary key, -- simpler than uuid for this demo
+  timezone text not null default 'UTC',
+  
+  -- Working Hours (minutes from midnight, e.g., 540 = 9:00 AM)
+  work_day_start int not null default 540, 
+  work_day_end int not null default 1020, -- 17:00
+  
+  -- Rules
+  meeting_duration int not null default 30, -- minutes
+  buffer_minutes int not null default 10,   -- buffer before/after
+  min_notice_minutes int not null default 60, -- prevent last-minute bookings
+  
+  created_at timestamptz default now(),
+  updated_at timestamptz default now() -- Fixed: Added missing column
+);
+
+-- 4. BOOKINGS TABLE (With Concurrency Protection)
+create table bookings (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  
+  organizer_id text not null references organizer_settings(organizer_id),
+  
+  -- Guest Info
+  guest_name text,
+  guest_email text not null,
+  
+  -- Time Info
+  start_time timestamptz not null,
+  end_time timestamptz not null,
+  
+  -- Status
+  status text not null default 'confirmed', -- confirmed, cancelled, rescheduled
+  
+  -- THE CONCURRENCY FIX
+  -- We exclude overlapping "Buffered" times for confirmed bookings.
+  buffered_start_time timestamptz not null,
+  buffered_end_time timestamptz not null,
+
+  exclude using gist (
+    organizer_id with =,
+    tstzrange(buffered_start_time, buffered_end_time) with &&
+  ) where (status = 'confirmed') 
+);
+
+-- 5. BLACKOUT DATES TABLE
+create table blackouts (
+  id uuid primary key default gen_random_uuid(),
+  organizer_id text not null references organizer_settings(organizer_id),
+  start_time timestamptz not null,
+  end_time timestamptz not null,
+  reason text,
+  
+  exclude using gist (
+    organizer_id with =,
+    tstzrange(start_time, end_time) with &&
+  )
+);
+
+-- 6. SECURITY POLICIES (RLS)
+-- We enable RLS but add a public policy for this demo to allow read/write from the frontend.
+
+-- Settings Permissions
+alter table organizer_settings enable row level security;
+create policy "Public Access Settings" on organizer_settings 
+  for all using (true) with check (true);
+
+-- Bookings Permissions
+alter table bookings enable row level security;
+create policy "Public Access Bookings" on bookings 
+  for all using (true) with check (true);
+
+-- Blackouts Permissions
+alter table blackouts enable row level security;
+create policy "Public Access Blackouts" on blackouts 
+  for all using (true) with check (true);
+
+-- 7. FUNCTIONS (Transaction Logic)
+-- RPC to safely Reschedule: Inserts new + Cancels old atomically
+create or replace function reschedule_meeting(
+  p_organizer_id text,
+  p_old_booking_id uuid,
+  p_guest_name text,
+  p_guest_email text,
+  p_start_time timestamptz,
+  p_end_time timestamptz,
+  p_buf_start timestamptz,
+  p_buf_end timestamptz
+) returns uuid as $$
+declare
+  v_new_id uuid;
+begin
+  -- A. Try to Insert New Booking (will fail if slot taken due to exclusion constraint)
+  insert into bookings (
+    organizer_id, guest_name, guest_email, 
+    start_time, end_time, 
+    buffered_start_time, buffered_end_time, 
+    status
+  ) values (
+    p_organizer_id, p_guest_name, p_guest_email,
+    p_start_time, p_end_time,
+    p_buf_start, p_buf_end,
+    'confirmed'
+  ) returning id into v_new_id;
+
+  -- B. If A succeeded, Cancel Old Booking
+  update bookings 
+  set status = 'rescheduled', updated_at = now()
+  where id = p_old_booking_id;
+
+  return v_new_id;
+end;
+$$ language plpgsql;
+
+-- 8. SEED DATA
+-- Initialize the organizer settings so the app works immediately
+insert into organizer_settings (organizer_id, timezone, meeting_duration, buffer_minutes)
+values ('speedrun-user', 'Asia/Jakarta', 30, 15)
+on conflict (organizer_id) do nothing;
