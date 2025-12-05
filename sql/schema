@@ -1,13 +1,16 @@
 -- ==========================================
--- MASTER SCHEMA MIGRATION
--- Meeting Scheduler (Speedrun Edition)
+-- MASTER SCHEMA MIGRATION v2
+-- Meeting Scheduler (Default vs. Special Case Edition)
 -- ==========================================
 
 -- 1. CLEANUP (Wipe everything to start fresh)
 -- ⚠️ WARNING: This deletes all data!
 drop function if exists reschedule_meeting;
+drop function if exists get_availability_for_date;
 drop table if exists bookings;
 drop table if exists blackouts;
+drop table if exists schedule_overrides;
+drop table if exists schedule_defaults;
 drop table if exists organizer_settings;
 drop extension if exists btree_gist;
 
@@ -15,30 +18,70 @@ drop extension if exists btree_gist;
 -- Required for the exclusion constraints (overlapping time checks)
 create extension if not exists btree_gist;
 
--- 3. ORGANIZER SETTINGS TABLE
+-- 3. ORGANIZER SETTINGS (Base Config)
 create table organizer_settings (
-  organizer_id text primary key, -- simpler than uuid for this demo
+  organizer_id text primary key,
   timezone text not null default 'UTC',
   
-  -- Working Hours (minutes from midnight, e.g., 540 = 9:00 AM)
-  work_day_start int not null default 540, 
-  work_day_end int not null default 1020, -- 17:00
-  
-  -- Rules
+  -- Rules that apply to ALL days
   meeting_duration int not null default 30, -- minutes
   buffer_minutes int not null default 10,   -- buffer before/after
   min_notice_minutes int not null default 60, -- prevent last-minute bookings
   
   created_at timestamptz default now(),
-  updated_at timestamptz default now() -- Fixed: Added missing column
+  updated_at timestamptz default now()
 );
 
--- 4. BOOKINGS TABLE (With Concurrency Protection)
+-- 4. SCHEDULE DEFAULTS (Layer 1: Recurring Weekly)
+-- "I usually work these hours on Mondays"
+create table schedule_defaults (
+  id uuid primary key default gen_random_uuid(),
+  organizer_id text not null references organizer_settings(organizer_id) on delete cascade,
+  
+  -- 0=Sun, 1=Mon, ... 6=Sat
+  day_of_week int not null check (day_of_week between 0 and 6),
+  
+  -- Minutes from midnight (e.g., 9:00 AM = 540)
+  start_minutes int not null check (start_minutes >= 0 and start_minutes <= 1440),
+  end_minutes int not null check (end_minutes >= 0 and end_minutes <= 1440),
+  
+  check (end_minutes > start_minutes),
+
+  -- Prevent overlapping slots on the same default day
+  exclude using gist (
+    organizer_id with =,
+    day_of_week with =,
+    int4range(start_minutes, end_minutes) with &&
+  )
+);
+
+-- 5. SCHEDULE OVERRIDES (Layer 2: Specific Dates)
+-- "But on December 25th, I work these hours instead"
+create table schedule_overrides (
+  id uuid primary key default gen_random_uuid(),
+  organizer_id text not null references organizer_settings(organizer_id) on delete cascade,
+  
+  -- The Specific Date (YYYY-MM-DD)
+  specific_date date not null,
+  
+  start_minutes int not null check (start_minutes >= 0 and start_minutes <= 1440),
+  end_minutes int not null check (end_minutes >= 0 and end_minutes <= 1440),
+  
+  check (end_minutes > start_minutes),
+
+  -- Prevent overlapping slots on the same specific date
+  exclude using gist (
+    organizer_id with =,
+    specific_date with =,
+    int4range(start_minutes, end_minutes) with &&
+  )
+);
+
+-- 6. BOOKINGS TABLE
 create table bookings (
   id uuid primary key default gen_random_uuid(),
   created_at timestamptz default now(),
   updated_at timestamptz default now(),
-  
   organizer_id text not null references organizer_settings(organizer_id),
   
   -- Guest Info
@@ -50,10 +93,9 @@ create table bookings (
   end_time timestamptz not null,
   
   -- Status
-  status text not null default 'confirmed', -- confirmed, cancelled, rescheduled
+  status text not null default 'confirmed', 
   
-  -- THE CONCURRENCY FIX
-  -- We exclude overlapping "Buffered" times for confirmed bookings.
+  -- Concurrency Protection
   buffered_start_time timestamptz not null,
   buffered_end_time timestamptz not null,
 
@@ -63,40 +105,39 @@ create table bookings (
   ) where (status = 'confirmed') 
 );
 
--- 5. BLACKOUT DATES TABLE
-create table blackouts (
-  id uuid primary key default gen_random_uuid(),
-  organizer_id text not null references organizer_settings(organizer_id),
-  start_time timestamptz not null,
-  end_time timestamptz not null,
-  reason text,
+-- 7. SMART AVAILABILITY FUNCTION
+-- This is the "Brain". It decides whether to look at Defaults or Overrides.
+create or replace function get_availability_for_date(
+  p_organizer_id text,
+  p_target_date date
+)
+returns table (start_minutes int, end_minutes int, source text) as $$
+begin
+  -- A. Check if ANY override exists for this specific date
+  if exists (
+    select 1 from schedule_overrides 
+    where organizer_id = p_organizer_id 
+    and specific_date = p_target_date
+  ) then
+    -- Return ONLY the overrides (ignore defaults completely)
+    return query 
+    select o.start_minutes, o.end_minutes, 'override'::text
+    from schedule_overrides o
+    where o.organizer_id = p_organizer_id 
+    and o.specific_date = p_target_date;
   
-  exclude using gist (
-    organizer_id with =,
-    tstzrange(start_time, end_time) with &&
-  )
-);
+  else
+    -- B. No override? Return the defaults for this day of week
+    return query 
+    select d.start_minutes, d.end_minutes, 'default'::text
+    from schedule_defaults d
+    where d.organizer_id = p_organizer_id 
+    and d.day_of_week = extract(dow from p_target_date)::int;
+  end if;
+end;
+$$ language plpgsql;
 
--- 6. SECURITY POLICIES (RLS)
--- We enable RLS but add a public policy for this demo to allow read/write from the frontend.
-
--- Settings Permissions
-alter table organizer_settings enable row level security;
-create policy "Public Access Settings" on organizer_settings 
-  for all using (true) with check (true);
-
--- Bookings Permissions
-alter table bookings enable row level security;
-create policy "Public Access Bookings" on bookings 
-  for all using (true) with check (true);
-
--- Blackouts Permissions
-alter table blackouts enable row level security;
-create policy "Public Access Blackouts" on blackouts 
-  for all using (true) with check (true);
-
--- 7. FUNCTIONS (Transaction Logic)
--- RPC to safely Reschedule: Inserts new + Cancels old atomically
+-- 8. RESCHEDULE FUNCTION (RPC)
 create or replace function reschedule_meeting(
   p_organizer_id text,
   p_old_booking_id uuid,
@@ -110,7 +151,6 @@ create or replace function reschedule_meeting(
 declare
   v_new_id uuid;
 begin
-  -- A. Try to Insert New Booking (will fail if slot taken due to exclusion constraint)
   insert into bookings (
     organizer_id, guest_name, guest_email, 
     start_time, end_time, 
@@ -123,7 +163,6 @@ begin
     'confirmed'
   ) returning id into v_new_id;
 
-  -- B. If A succeeded, Cancel Old Booking
   update bookings 
   set status = 'rescheduled', updated_at = now()
   where id = p_old_booking_id;
@@ -132,8 +171,27 @@ begin
 end;
 $$ language plpgsql;
 
--- 8. SEED DATA
--- Initialize the organizer settings so the app works immediately
-insert into organizer_settings (organizer_id, timezone, meeting_duration, buffer_minutes)
-values ('speedrun-user', 'Asia/Jakarta', 30, 15)
-on conflict (organizer_id) do nothing;
+-- 9. RLS POLICIES (Security)
+alter table organizer_settings enable row level security;
+alter table schedule_defaults enable row level security;
+alter table schedule_overrides enable row level security;
+alter table bookings enable row level security;
+
+create policy "Public Read Settings" on organizer_settings for select using (true);
+create policy "Public Read Defaults" on schedule_defaults for select using (true);
+create policy "Public Read Overrides" on schedule_overrides for select using (true);
+create policy "Public Read Bookings" on bookings for select using (true);
+-- Note: In production, restrict INSERT/UPDATE to the owner!
+
+-- 10. SEED DATA (Example)
+insert into organizer_settings (organizer_id, timezone, meeting_duration)
+values ('speedrun-user', 'Asia/Jakarta', 30)
+on conflict do nothing;
+
+-- Default: Mondays are 09:00 - 17:00
+insert into schedule_defaults (organizer_id, day_of_week, start_minutes, end_minutes)
+values ('speedrun-user', 1, 540, 1020);
+
+-- Special Case: Specific Monday (2025-12-08) is Half Day (13:00 - 17:00)
+insert into schedule_overrides (organizer_id, specific_date, start_minutes, end_minutes)
+values ('speedrun-user', '2025-12-08', 780, 1020);

@@ -1,4 +1,4 @@
-import { supabase } from '@/lib/supabase';
+import { supabase, supabaseAdmin } from '@/lib/supabase';
 import { NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
@@ -21,7 +21,7 @@ export async function POST(req: Request) {
   
   // Basic validation could go here
   
-  const { data, error } = await supabase
+  const { data, error } = await supabaseAdmin
     .from('organizer_settings')
     .upsert({
       organizer_id: 'speedrun-user',

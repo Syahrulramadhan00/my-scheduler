@@ -21,78 +21,77 @@ export async function GET(request: Request) {
 
   if (!settings) return NextResponse.json({ error: 'Organizer not found' }, { status: 404 });
 
-  // 2. DEFINE RANGE (In Organizer's Timezone)
-  // We construct the start/end of the working day in the Organizer's TZ, then convert to UTC
-  const organizerTz = settings.timezone;
-  
-  // Create a date object at midnight of the requested date in the organizer's TZ
-  // "2025-11-24" -> Midnight Jakarta Time
-  const dayStartZoned = fromZonedTime(`${dateParam} 00:00:00`, organizerTz);
-  
-  // Calculate Start/End of work day based on minutes from midnight
-  const workStartUtc = addMinutes(dayStartZoned, settings.work_day_start);
-  const workEndUtc = addMinutes(dayStartZoned, settings.work_day_end);
-
-  // 3. FETCH DATA (Bookings & Blackouts)
-  // We fetch everything overlapping this specific day
-  const { data: bookings } = await supabase
-    .from('bookings')
-    .select('buffered_start_time, buffered_end_time')
-    .eq('organizer_id', organizerId)
-    .eq('status', 'confirmed')
-    .lt('buffered_start_time', workEndUtc.toISOString())
-    .gt('buffered_end_time', workStartUtc.toISOString());
-
-  const { data: blackouts } = await supabase
-    .from('blackouts')
-    .select('start_time, end_time')
-    .eq('organizer_id', organizerId)
-    .lt('start_time', workEndUtc.toISOString())
-    .gt('end_time', workStartUtc.toISOString());
-
-  // 4. GENERATE SLOTS
-  const slots = [];
-  let currentSlot = workStartUtc;
-  const now = new Date();
-
-  while (isBefore(addMinutes(currentSlot, settings.meeting_duration), workEndUtc)) {
-    const slotEnd = addMinutes(currentSlot, settings.meeting_duration);
-    
-    // VALIDATION 1: Minimum Notice
-    // If the slot is in the past or too soon
-    if (isBefore(currentSlot, addMinutes(now, settings.min_notice_minutes))) {
-      currentSlot = addMinutes(currentSlot, settings.meeting_duration);
-      continue;
-    }
-
-    // VALIDATION 2: Buffer Calculation
-    // We must check if the "Buffered Slot" overlaps with anything
-    const bufferStart = addMinutes(currentSlot, -settings.buffer_minutes);
-    const bufferEnd = addMinutes(slotEnd, settings.buffer_minutes);
-
-    const isBooked = bookings?.some((b) => {
-      const bStart = parseISO(b.buffered_start_time);
-      const bEnd = parseISO(b.buffered_end_time);
-      return isBefore(bufferStart, bEnd) && isBefore(bStart, bufferEnd);
+  // 2. GET AVAILABILITY SLOTS FOR THIS SPECIFIC DATE
+  // This function will return either overrides (if any exist for this date) or defaults (recurring weekly)
+  const { data: availabilitySlots, error: availError } = await supabase
+    .rpc('get_availability_for_date', {
+      p_organizer_id: organizerId,
+      p_target_date: dateParam
     });
 
-    const isBlackedOut = blackouts?.some((b) => {
-      const bStart = parseISO(b.start_time);
-      const bEnd = parseISO(b.end_time);
-      return isBefore(currentSlot, bEnd) && isBefore(bStart, slotEnd);
-    });
-
-    if (!isBooked && !isBlackedOut) {
-      slots.push(currentSlot.toISOString());
-    }
-
-    // Step forward
-    currentSlot = addMinutes(currentSlot, settings.meeting_duration);
+  if (availError) {
+    return NextResponse.json({ error: availError.message }, { status: 500 });
   }
 
-  // Return slots AND the rules (so frontend knows duration/buffer for inserting)
+  // If no availability slots, return empty
+  if (!availabilitySlots || availabilitySlots.length === 0) {
+    return NextResponse.json({ slots: [], settings: { duration: settings.meeting_duration, buffer: settings.buffer_minutes } });
+  }
+
+  // 3. PROCESS EACH AVAILABILITY SLOT
+  const organizerTz = settings.timezone;
+  const dayStartZoned = fromZonedTime(`${dateParam} 00:00:00`, organizerTz);
+  const allSlots: string[] = [];
+
+  // Loop through each availability window for this date
+  for (const availWindow of availabilitySlots) {
+    const workStartUtc = addMinutes(dayStartZoned, availWindow.start_minutes);
+    const workEndUtc = addMinutes(dayStartZoned, availWindow.end_minutes);
+
+    // 4. FETCH DATA (Bookings) for this specific window
+    const { data: bookings } = await supabase
+      .from('bookings')
+      .select('buffered_start_time, buffered_end_time')
+      .eq('organizer_id', organizerId)
+      .eq('status', 'confirmed')
+      .lt('buffered_start_time', workEndUtc.toISOString())
+      .gt('buffered_end_time', workStartUtc.toISOString());
+
+    // 5. GENERATE SLOTS for this window
+    let currentSlot = workStartUtc;
+    const now = new Date();
+
+    while (isBefore(addMinutes(currentSlot, settings.meeting_duration), workEndUtc)) {
+      const slotEnd = addMinutes(currentSlot, settings.meeting_duration);
+      
+      // VALIDATION 1: Minimum Notice
+      if (isBefore(currentSlot, addMinutes(now, settings.min_notice_minutes))) {
+        currentSlot = addMinutes(currentSlot, settings.meeting_duration);
+        continue;
+      }
+
+      // VALIDATION 2: Buffer Calculation
+      const bufferStart = addMinutes(currentSlot, -settings.buffer_minutes);
+      const bufferEnd = addMinutes(slotEnd, settings.buffer_minutes);
+
+      const isBooked = bookings?.some((b) => {
+        const bStart = parseISO(b.buffered_start_time);
+        const bEnd = parseISO(b.buffered_end_time);
+        return isBefore(bufferStart, bEnd) && isBefore(bStart, bufferEnd);
+      });
+
+      if (!isBooked) {
+        allSlots.push(currentSlot.toISOString());
+      }
+
+      // Step forward
+      currentSlot = addMinutes(currentSlot, settings.meeting_duration);
+    }
+  }
+
+  // Return slots AND the rules
   return NextResponse.json({
-    slots,
+    slots: allSlots,
     settings: {
       duration: settings.meeting_duration,
       buffer: settings.buffer_minutes
